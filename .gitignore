@@ -1,0 +1,26 @@
+# Secrets — NEVER commit these.
+.api-keys
+ngrok.env
+*.pem
+*.key
+
+# Hugging Face partial-download stubs.
+*.incomplete
+.cache/
+
+# Claude / local tooling cruft.
+.claude/
+
+# Editor / OS files.
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Python (in case anyone runs the gateway app locally).
+__pycache__/
+*.pyc
+.venv/
+
+# Docker ephemeral.
+.docker-tmp/

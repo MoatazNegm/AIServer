@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>vLLM Gateway Playground</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+    h1 { font-size: 20px; margin-bottom: 0; }
+    p.lead { color: #555; margin-top: 4px; }
+    label { display: block; font-size: 13px; color: #444; margin: 14px 0 4px; }
+    input, textarea, select { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: inherit; font-size: 14px; }
+    textarea { min-height: 110px; font-family: ui-monospace, monospace; }
+    button { background: #2563eb; color: #fff; border: 0; border-radius: 4px; padding: 9px 18px; font-size: 14px; cursor: pointer; margin-top: 16px; }
+    button:disabled { background: #94a3b8; cursor: not-allowed; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 14px; border-radius: 4px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .status { font-size: 13px; color: #555; margin-top: 8px; }
+    .err { color: #b91c1c; }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+  </style>
+</head>
+<body>
+  <h1>vLLM Gateway Playground</h1>
+  <p class="lead">Sends a real POST /v1/chat/completions to the gateway.</p>
+
+  <label for="endpoint">Endpoint URL</label>
+  <input id="endpoint" type="text" value="https://equation-kelp-hypnotist.ngrok-free.dev/v1/chat/completions">
+
+  <label for="key">API key</label>
+  <input id="key" type="password" placeholder="paste your API key (X-API-Key or Bearer)">
+
+  <div class="row">
+    <div>
+      <label for="model">Model</label>
+      <input id="model" type="text" value="Qwen/Qwen2.5-7B-Instruct">
+    </div>
+    <div>
+      <label for="max">max_tokens</label>
+      <input id="max" type="number" value="200" min="1" max="4096">
+    </div>
+  </div>
+
+  <label for="messages">Messages (JSON array)</label>
+  <textarea id="messages">[{"role": "user", "content": "Who are you?"}]</textarea>
+
+  <button id="send">Send</button>
+  <div class="status" id="status">ready</div>
+
+  <label style="margin-top:24px">Response</label>
+  <pre id="out">(not sent yet)</pre>
+
+  <script>
+    const $ = (s) => document.querySelector(s);
+    $("#send").addEventListener("click", async () => {
+      const url    = $("#endpoint").value.trim();
+      const key    = $("#key").value.trim();
+      const model  = $("#model").value.trim();
+      const max    = parseInt($("#max").value, 10);
+      let messages;
+      try { messages = JSON.parse($("#messages").value); }
+      catch (e) { $("#status").textContent = "bad JSON in messages: " + e.message; return; }
+
+      const body = JSON.stringify({ model, messages, max_tokens: max });
+
+      $("#send").disabled = true;
+      $("#status").textContent = "sending...";
+      $("#out").textContent = "(waiting)";
+
+      try {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + key
+          },
+          body
+        });
+        const text = await r.text();
+        let pretty = text;
+        try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+        $("#out").textContent = "HTTP " + r.status + "\n" + pretty;
+        $("#status").textContent = "HTTP " + r.status + (r.ok ? " (ok)" : " (error)");
+      } catch (e) {
+        $("#out").textContent = "network error: " + e;
+        $("#status").textContent = "network error";
+      } finally {
+        $("#send").disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
