@@ -45,16 +45,73 @@ VLLM_URL = os.environ.get("VLLM_URL", "http://vllm-server:8000").rstrip("/")
 DEFAULT_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 DEFAULT_MAX_TOKENS = int(os.environ.get("VLLM_MAX_TOKENS", "256"))
 
+# Server-side caps to stop clients (e.g. KiloCode) from overshooting the
+# model's context window. Two knobs:
+#   - MODEL_MAX_CONTEXT: total input+output tokens the model supports.
+#                        Must match start-vllm.sh --max-model-len (default 32768).
+#   - MAX_OUTPUT_TOKENS_HARD_CAP: absolute ceiling for a single reply,
+#                                 regardless of how much room the prompt uses.
+MODEL_MAX_CONTEXT = int(os.environ.get("MODEL_MAX_CONTEXT", "32768"))
+MAX_OUTPUT_TOKENS_HARD_CAP = int(os.environ.get("MAX_OUTPUT_TOKENS_HARD_CAP", "16384"))
+
+
+def _estimate_tokens(messages: list[dict]) -> int:
+    """Rough token estimate from a list of OpenAI-style chat messages.
+
+    We can't reach HuggingFace from inside this container (vllm-net has
+    no DNS for huggingface.co), so we can't load the real Qwen
+    tokenizer. We use a deliberately-conservative heuristic: 2 chars
+    per token. English prose is ~4 chars/token so this overestimates
+    by ~2x (which only makes output caps slightly tighter — harmless).
+    Sparse content like "x " repeated or short tokens in code can be
+    1-2 chars/token, and our estimate handles that correctly.
+    """
+    total = 0
+    for m in messages:
+        # 8 tokens of per-message overhead (role, separators, etc.)
+        total += 8
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c) // 2
+        # Tool-call messages carry an extra JSON blob
+        if "tool_calls" in m and isinstance(m["tool_calls"], list):
+            for tc in m["tool_calls"]:
+                total += len(json.dumps(tc)) // 2
+        if m.get("tool_call_id"):
+            total += 8 + len(m["tool_call_id"]) // 2
+    # ~5% safety margin so we don't land exactly on the boundary
+    return int(total * 1.05) + 16
+
+
+def _cap_max_tokens(body: dict) -> tuple[int, int, str | None]:
+    """Returns (requested, capped, note). `note` is non-null if we lowered."""
+    requested = int(body.get("max_tokens") or 1024)
+    # 1. Hard ceiling so a single reply can't be absurd.
+    cap = min(requested, MAX_OUTPUT_TOKENS_HARD_CAP)
+    # 2. Reserve room for input.
+    msgs = body.get("messages") or []
+    used_input = _estimate_tokens(msgs) if isinstance(msgs, list) else 0
+    room_for_output = MODEL_MAX_CONTEXT - used_input - 32  # safety
+    if room_for_output < 64:
+        room_for_output = 64  # never go below 64 — agent still needs SOMETHING
+    cap = min(cap, room_for_output)
+    note = None
+    if cap < requested:
+        note = (
+            f"requested {requested}; gateway capped to {cap} "
+            f"(input est. {used_input}, model ctx {MODEL_MAX_CONTEXT})"
+        )
+    return requested, cap, note
+
 
 # ---------------------------------------------------------------------------
 # API key loading
+# Reads once at startup. To rotate keys: edit .api-keys on the host,
+# then `docker restart vllm-gateway`. (See gateway-keygen.sh --add for
+# the canonical workflow.)
 # ---------------------------------------------------------------------------
 def _load_keys() -> set[str]:
-    """Return the set of valid API keys, from API_KEYS_FILE or API_KEYS env."""
     keys: set[str] = set()
-
-    # File takes precedence. One key per line, # starts a comment, blanks
-    # ignored. We don't care about whitespace stripping too aggressively.
     keys_file = os.environ.get("API_KEYS_FILE", "").strip()
     if keys_file:
         p = Path(keys_file)
@@ -64,8 +121,6 @@ def _load_keys() -> set[str]:
                 if not line or line.startswith("#"):
                     continue
                 keys.add(line)
-
-    # Fall back to env var (or add to whatever the file already gave us).
     env_keys = os.environ.get("API_KEYS", "").strip()
     if env_keys:
         for k in env_keys.split(","):
@@ -77,6 +132,10 @@ def _load_keys() -> set[str]:
 
 VALID_KEYS: set[str] = _load_keys()
 AUTH_REQUIRED = bool(VALID_KEYS)
+
+
+# json.dumps is needed by _estimate_tokens when tool_calls are present.
+import json
 
 
 def _extract_key(request: Request) -> str | None:
@@ -281,13 +340,37 @@ async def openai_list_models(request: Request) -> Response:
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def openai_chat_completions(request: Request) -> Response:
-    """OpenAI-compatible: POST /v1/chat/completions."""
-    return await _proxy(request, "POST")
+    """OpenAI-compatible: POST /v1/chat/completions.
+
+    Capped server-side: max_tokens is clamped to fit within
+    MODEL_MAX_CONTEXT minus the estimated input size, and never
+    exceeds MAX_OUTPUT_TOKENS_HARD_CAP. Prevents 400 errors from
+    clients (e.g. KiloCode) that ask for absurdly large replies.
+    """
+    body = await request.json()
+    requested, capped, note = _cap_max_tokens(body)
+    if capped != requested or "max_tokens" not in body:
+        body["max_tokens"] = capped
+    request._body = json.dumps(body).encode()
+    resp = await _proxy(request, "POST")
+    if note:
+        # Echo the cap decision in the response header so the client
+        # can log it (useful for "why didn't I get 32k tokens?" debugging).
+        resp.headers["X-vLLM-Gateway-Cap"] = note
+    return resp
 
 
 @app.post("/v1/completions", dependencies=[Depends(require_api_key)])
 async def openai_completions(request: Request) -> Response:
     """OpenAI-compatible: POST /v1/completions (legacy text completions)."""
-    return await _proxy(request, "POST")
+    body = await request.json()
+    requested, capped, note = _cap_max_tokens(body)
+    if capped != requested or "max_tokens" not in body:
+        body["max_tokens"] = capped
+    request._body = json.dumps(body).encode()
+    resp = await _proxy(request, "POST")
+    if note:
+        resp.headers["X-vLLM-Gateway-Cap"] = note
+    return resp
 
 

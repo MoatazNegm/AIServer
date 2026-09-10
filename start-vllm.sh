@@ -110,14 +110,17 @@ fi
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-# Is $1 (model id like "Org/Name") already downloaded in the HF cache?
-# HF stores them as: $HF_CACHE/hub/models--<Org>--<Name>/snapshots/
+# Is $1 (model id like "Org/Name") really downloaded?
+# A "downloaded" model has at least one *.safetensors shard > 100 MB
+# in its snapshots dir. Config + tokenizer files alone (a few KB)
+# don't count — they'd fool a naive "is the dir non-empty?" check.
 is_model_downloaded() {
     local id="$1"
     [[ -n "$id" ]] || return 1
     local slug="${id//\//--}"
-    [[ -d "$HF_CACHE/hub/models--$slug/snapshots" ]] && \
-        [[ -n "$(ls -A "$HF_CACHE/hub/models--$slug/snapshots" 2>/dev/null)" ]]
+    local snap="$HF_CACHE/hub/models--$slug/snapshots"
+    [[ -d "$snap" ]] && \
+        find "$snap" -name '*.safetensors' -size +100M 2>/dev/null | grep -q .
 }
 
 # What model is the running vllm-server serving? Reads from the last
@@ -157,41 +160,45 @@ wait_for_gpu_free() {
 }
 
 # ---------------------------------------------------------------------------
-# If vllm-server is already running, decide whether to swap or leave alone.
+# Decide what to do
 # ---------------------------------------------------------------------------
+docker network create "$NETWORK" >/dev/null 2>&1 || true
+
+CURRENT_MODEL="$(running_model)"
+echo "Current $NAME:  ${CURRENT_MODEL:-not running}"
+echo "Requested:    $MODEL"
+echo "Downloaded:   $(is_model_downloaded "$MODEL" && echo yes || echo no)"
+
+# Case A: same model already running → no-op.
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$NAME" \
+        && [[ -n "$CURRENT_MODEL" && "$CURRENT_MODEL" == "$MODEL" ]]; then
+    echo "vllm-server is already running with $MODEL — leaving it alone."
+    echo "  logs:  docker logs -f $NAME"
+    echo "  stop:  docker stop $NAME"
+    exit 0
+fi
+
+# Case B: different model needed (or no container running) and the new
+# model's weights aren't on disk yet → fetch them FIRST. The OLD vllm-server
+# keeps serving until we explicitly stop it. Then we stop, wait for GPU to
+# free, and start the new one (which loads from cache in ~30 s).
+if ! is_model_downloaded "$MODEL"; then
+    echo "Downloading $MODEL weights to $HF_CACHE (uses plain curl — the HF Python library stalls on this host) …"
+    "$SCRIPT_DIR/download-model.sh" "$MODEL" "$HF_CACHE"
+    echo "  download complete."
+fi
+
+# Stop the OLD vllm-server (brief service interruption starts here).
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$NAME"; then
-    current="$(running_model)"
-    if [[ -n "$current" && "$current" == "$MODEL" ]]; then
-        echo "vllm-server is already running with $MODEL — leaving it alone."
-        echo "  logs:  docker logs -f $NAME"
-        echo "  stop:  docker stop $NAME"
-        exit 0
-    fi
-    echo "vllm-server is running with: ${current:-<unknown model>}"
-    echo "switching to: $MODEL"
-    docker stop "$NAME" 2>&1 | tail -1 || true
-    # docker rm runs after the container has stopped; --restart unless-stopped
-    # would otherwise resurrect it with the OLD model.
+    echo "Swapping $NAME from ${CURRENT_MODEL:-<unknown>} to $MODEL …"
+    docker stop "$NAME" >/dev/null 2>&1 || true
     docker wait "$NAME" >/dev/null 2>&1 || true
     docker rm -f "$NAME" >/dev/null 2>&1 || true
-    echo "  waiting for GPU memory to free..."
+    echo "  waiting for GPU memory to free…"
     wait_for_gpu_free 120
 fi
 
-# ---------------------------------------------------------------------------
-# Sanity check + launch (unchanged from before).
-# ---------------------------------------------------------------------------
-docker network create "$NETWORK" >/dev/null 2>&1 || true
-docker rm -f "$NAME" >/dev/null 2>&1 || true
-
-if is_model_downloaded "$MODEL"; then
-    echo "model $MODEL is already in the local cache — no download needed."
-else
-    echo "model $MODEL is NOT yet cached."
-    echo "  vLLM will download it on first start. On this host that's ~250 KB/s,"
-    echo "  so plan accordingly (Qwen2.5-3B ~6 GB ≈ 6h, Qwen2.5-7B ~14 GB ≈ 14h)."
-fi
-
+# Start the NEW vllm-server (loads from cache — ~30 s instead of hours).
 docker run -d \
     --name "$NAME" \
     --network "$NETWORK" \
@@ -207,8 +214,10 @@ docker run -d \
     --host 0.0.0.0 \
     --port 8000 \
     --dtype float16 \
-    --gpu-memory-utilization 0.85 \
-    --max-model-len 8192
+    --gpu-memory-utilization 0.9 \
+    --max-model-len 32768 \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes
 
 echo
 echo "vLLM server '$NAME' starting."

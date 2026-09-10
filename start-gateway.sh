@@ -42,9 +42,7 @@ docker network create "$NETWORK" >/dev/null 2>&1 || true
 # Restart cleanly.
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
-# Build the docker run args. The image name goes BEFORE the container
-# command — anything appended after the image is treated as command args.
-# So we put the image in the middle and the command at the end.
+# Build the docker run args.
 run_args=(
     -d --name "$NAME"
     --restart unless-stopped
@@ -54,10 +52,12 @@ run_args=(
     -e VLLM_URL="${VLLM_URL:-http://vllm-server:8000}"
     -e VLLM_MODEL="${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
     -e VLLM_MAX_TOKENS="${VLLM_MAX_TOKENS:-256}"
+    -e MODEL_MAX_CONTEXT="${MODEL_MAX_CONTEXT:-32768}"
+    -e MAX_OUTPUT_TOKENS_HARD_CAP="${MAX_OUTPUT_TOKENS_HARD_CAP:-16384}"
 )
 
-# If a keys file exists, bind-mount it read-only into the container and
-# tell the gateway to load it. Otherwise the gateway runs in open mode.
+# Bind-mount the keys file into the container at startup. New keys take
+# effect after `docker restart vllm-gateway` (see gateway-keygen.sh).
 auth_state="open (no API key required)"
 if [[ -f "$KEYS_FILE" ]] && [[ -s "$KEYS_FILE" ]]; then
     n=$(grep -cE '^[A-Za-z0-9._-]{16,}$' "$KEYS_FILE" 2>/dev/null || echo 0)
@@ -67,7 +67,7 @@ if [[ -f "$KEYS_FILE" ]] && [[ -s "$KEYS_FILE" ]]; then
     fi
 fi
 
-# Image + container command (everything after this is passed to the entrypoint).
+# Image + container command.
 run_args+=( --entrypoint python3 vllm-a4500:latest
             -m uvicorn app:app --app-dir /app --host 0.0.0.0 --port 9000 )
 

@@ -67,6 +67,19 @@ print('vllm', vllm.__version__)
 # No assert — GPU is not visible during `docker build`.
 PY
 
-# Default entrypoint is the upstream vllm OpenAI-compatible server
+# Default entrypoint runs the upstream vllm OpenAI-compatible server.
+# The CMD below is the canonical baseline: 32k context, fp16, tool calling
+# on (hermes parser), bind on all interfaces. start-vllm.sh overrides
+# --model and CMD args at run time; everything else is the recommended
+# baseline.
+#
+# This image can ALSO serve as the gateway container. To use it as a
+# gateway, override the entrypoint and CMD, e.g.:
+#   docker run ... --entrypoint python3 \
+#     vllm-a4500:latest -m uvicorn app:app --app-dir /app ...
+# The /app/app.py below is the auth-enforcing, OpenAI-compatible gateway
+# with smart max_tokens capping (MODEL_MAX_CONTEXT / MAX_OUTPUT_TOKENS_HARD_CAP).
+COPY gateway/app.py /app/app.py
+
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
-CMD ["--help"]
+CMD ["--max-model-len", "32768", "--gpu-memory-utilization", "0.9", "--dtype", "float16", "--enable-auto-tool-choice", "--tool-call-parser", "hermes", "--host", "0.0.0.0", "--port", "8000"]
