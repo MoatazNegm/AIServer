@@ -54,6 +54,60 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("VLLM_MAX_TOKENS", "256"))
 MODEL_MAX_CONTEXT = int(os.environ.get("MODEL_MAX_CONTEXT", "32768"))
 MAX_OUTPUT_TOKENS_HARD_CAP = int(os.environ.get("MAX_OUTPUT_TOKENS_HARD_CAP", "16384"))
 
+# Model-agnostic proxying. The gateway queries vLLM every MODEL_CACHE_TTL
+# seconds and rewrites incoming `model` fields to whatever is actually
+# loaded. This lets an agent (KiloCode etc.) keep a fixed model in its
+# config and still hit whatever is currently running — useful when the
+# admin swaps models on the host. Set MODEL_REWRITE=disabled to disable.
+import time
+
+_MODEL_CACHE = {"id": None, "fetched_at": 0.0}
+_MODEL_CACHE_TTL = int(os.environ.get("MODEL_CACHE_TTL", "30"))
+_MODEL_REWRITE = os.environ.get("MODEL_REWRITE", "enabled").lower() != "disabled"
+
+
+async def _current_vllm_model() -> str | None:
+    """Return the model id vLLM is currently serving, cached for TTL seconds.
+
+    Calls vLLM's /v1/models and returns the first `id`. Returns None if
+    vLLM is unreachable or no model is loaded yet — callers should fall
+    through to letting vLLM emit its own 503.
+    """
+    now = time.time()
+    if _MODEL_CACHE["id"] is not None and (now - _MODEL_CACHE["fetched_at"]) < _MODEL_CACHE_TTL:
+        return _MODEL_CACHE["id"]
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            r = await c.get(f"{VLLM_URL}/v1/models")
+        if r.status_code != 200:
+            return _MODEL_CACHE["id"]
+        for m in r.json().get("data", []):
+            if m.get("id"):
+                _MODEL_CACHE["id"] = m["id"]
+                _MODEL_CACHE["fetched_at"] = now
+                return _MODEL_CACHE["id"]
+    except Exception:
+        pass
+    return _MODEL_CACHE["id"]
+
+
+async def _maybe_rewrite_model(body: dict) -> str | None:
+    """If the client's requested model differs from what vLLM serves,
+    rewrite it in-place. Returns a human-readable note describing the swap
+    (suitable for an `X-Model-Rewrite` response header), or None if no
+    rewrite was needed.
+    """
+    if not _MODEL_REWRITE:
+        return None
+    requested = body.get("model")
+    if not requested:
+        return None
+    current = await _current_vllm_model()
+    if not current or current == requested:
+        return None
+    body["model"] = current
+    return f"{requested} → {current}"
+
 
 def _estimate_tokens(messages: list[dict]) -> int:
     """Rough token estimate from a list of OpenAI-style chat messages.
@@ -342,21 +396,25 @@ async def openai_list_models(request: Request) -> Response:
 async def openai_chat_completions(request: Request) -> Response:
     """OpenAI-compatible: POST /v1/chat/completions.
 
-    Capped server-side: max_tokens is clamped to fit within
-    MODEL_MAX_CONTEXT minus the estimated input size, and never
-    exceeds MAX_OUTPUT_TOKENS_HARD_CAP. Prevents 400 errors from
-    clients (e.g. KiloCode) that ask for absurdly large replies.
+    Two things happen before forwarding:
+      - max_tokens is clamped to fit the model's context window
+        (MODEL_MAX_CONTEXT minus estimated input, hard-capped at
+        MAX_OUTPUT_TOKENS_HARD_CAP).
+      - the `model` field is silently rewritten to whatever vLLM is
+        actually serving (cached for MODEL_CACHE_TTL). This lets an
+        agent keep its configured model and still hit the running one.
     """
     body = await request.json()
-    requested, capped, note = _cap_max_tokens(body)
+    rewrite_note = await _maybe_rewrite_model(body)
+    requested, capped, cap_note = _cap_max_tokens(body)
     if capped != requested or "max_tokens" not in body:
         body["max_tokens"] = capped
     request._body = json.dumps(body).encode()
     resp = await _proxy(request, "POST")
-    if note:
-        # Echo the cap decision in the response header so the client
-        # can log it (useful for "why didn't I get 32k tokens?" debugging).
-        resp.headers["X-vLLM-Gateway-Cap"] = note
+    if cap_note:
+        resp.headers["X-vLLM-Gateway-Cap"] = cap_note
+    if rewrite_note:
+        resp.headers["X-Model-Rewrite"] = rewrite_note
     return resp
 
 
@@ -364,13 +422,16 @@ async def openai_chat_completions(request: Request) -> Response:
 async def openai_completions(request: Request) -> Response:
     """OpenAI-compatible: POST /v1/completions (legacy text completions)."""
     body = await request.json()
-    requested, capped, note = _cap_max_tokens(body)
+    rewrite_note = await _maybe_rewrite_model(body)
+    requested, capped, cap_note = _cap_max_tokens(body)
     if capped != requested or "max_tokens" not in body:
         body["max_tokens"] = capped
     request._body = json.dumps(body).encode()
     resp = await _proxy(request, "POST")
-    if note:
-        resp.headers["X-vLLM-Gateway-Cap"] = note
+    if cap_note:
+        resp.headers["X-vLLM-Gateway-Cap"] = cap_note
+    if rewrite_note:
+        resp.headers["X-Model-Rewrite"] = rewrite_note
     return resp
 
 

@@ -54,6 +54,7 @@ run_args=(
     -e VLLM_MAX_TOKENS="${VLLM_MAX_TOKENS:-256}"
     -e MODEL_MAX_CONTEXT="${MODEL_MAX_CONTEXT:-32768}"
     -e MAX_OUTPUT_TOKENS_HARD_CAP="${MAX_OUTPUT_TOKENS_HARD_CAP:-16384}"
+    -e MODEL_CACHE_TTL="${MODEL_CACHE_TTL:-30}"
 )
 
 # Bind-mount the keys file into the container at startup. New keys take
